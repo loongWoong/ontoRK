@@ -1,0 +1,11 @@
+{
+  "objects": [
+    {"type": "Vehicle", "id": "V001", "properties": {"plate": "鲁A12345", "type": "ETC", "balance": 100}},
+    {"type": "Vehicle", "id": "V002", "properties": {"plate": "鲁B67890", "type": "ETC", "balance": 20}},
+    {"type": "TollStation", "id": "ST001", "properties": {"name": "济南西", "status": "open"}},
+    {"type": "TollStation", "id": "ST002", "properties": {"name": "泰安", "status": "open"}}
+  ],
+  "relations": [
+    {"source": "Vehicle/V001", "relation": "passes", "target": "TollStation/ST001"}
+  ]
+}

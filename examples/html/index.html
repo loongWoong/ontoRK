@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Ontology Runtime - Vehicle Demo</title>
+<style>
+  :root {
+    --bg: #f5f4f1; --card: #ffffff; --ink: #1c1c1a; --muted: #6f6d68;
+    --line: #e4e2dc; --accent: #1a56db; --ok: #0e7a4a;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--ink); padding: 40px 24px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px;
+  }
+  .card h2 { font-size: 15px; display: flex; justify-content: space-between; }
+  .card h2 .ref { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .props { margin: 12px 0; border-top: 1px solid var(--line); }
+  .props div { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .props span:first-child { color: var(--muted); }
+  .rel { font-size: 12px; color: var(--muted); margin: 8px 0; }
+  .rel b { color: var(--ink); font-weight: 500; }
+  button {
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; margin-right: 8px;
+  }
+  button.ghost { background: transparent; color: var(--accent); }
+  .log {
+    margin-top: 28px; background: #14161a; color: #d5e0ee; border-radius: 10px;
+    padding: 16px; font: 12px/1.6 Consolas, monospace; white-space: pre-wrap;
+    max-height: 320px; overflow: auto;
+  }
+  .err { color: #ff9c9c; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ontology Runtime Kernel — traffic demo</h1>
+  <div class="sub">describe → find → get → related → invoke，全部通过 HTTP Adapter 访问同一个 Runtime</div>
+  <div>
+    <button onclick="loadDescribe()">describe</button>
+    <button class="ghost" onclick="loadVehicles()">find Vehicle</button>
+  </div>
+  <div class="grid" id="cards" style="margin-top:20px"></div>
+  <div class="log" id="log">log…</div>
+</div>
+<script>
+const API = "http://127.0.0.1:8000";
+const logEl = document.getElementById("log");
+let logLines = [];
+function log(msg, isError) {
+  logLines.unshift((isError ? "✗ " : "✓ ") + msg);
+  logLines = logLines.slice(0, 40);
+  logEl.innerHTML = logLines.map(l => l.startsWith("✗") ? `<span class="err">${l}</span>` : l).join("\n");
+}
+async function api(path, options) {
+  const res = await fetch(API + path, options);
+  const data = await res.json();
+  log(`${options?.method || "GET"} ${path} → ${res.status} ${JSON.stringify(data).slice(0, 160)}`, !res.ok);
+  return data;
+}
+async function loadDescribe() {
+  const d = await api("/describe");
+  alert("objects: " + d.objects.map(o => o.name).join(", ")
+    + "\nrelations: " + d.relations.map(r => r.name).join(", ")
+    + "\nfunctions: " + d.functions.map(f => f.name).join(", "));
+}
+async function loadVehicles() {
+  const vehicles = await api("/objects/Vehicle");
+  const stations = await api("/objects/TollStation");
+  const cards = document.getElementById("cards");
+  cards.innerHTML = "";
+  for (const v of vehicles) renderVehicle(v, stations);
+}
+async function renderVehicle(v, stations) {
+  const rel = await api(`/objects/${v.type}/${v.id}/related/passes`);
+  const names = rel.map(o => o.properties.name).join("、") || "（无）";
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <h2>${v.properties.plate} <span class="ref">${v.type}/${v.id}</span></h2>
+    <div class="props">
+      <div><span>车型</span><span>${v.properties.type}</span></div>
+      <div><span>余额</span><span>¥${v.properties.balance}</span></div>
+    </div>
+    <div class="rel">通过收费站<br><b>${names}</b></div>
+    <button onclick="recharge('${v.type}','${v.id}')">充值 100</button>
+    <button class="ghost" onclick="pass('${v.type}','${v.id}')">过站 ST002 (¥30)</button>`;
+  document.getElementById("cards").appendChild(card);
+}
+async function recharge(type, id) {
+  await api("/invoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ function: "Vehicle.recharge", target: { type, id }, args: { amount: 100 } })
+  });
+  loadVehicles();
+}
+async function pass(type, id) {
+  await api("/invoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ function: "Vehicle.pass_station", target: { type, id }, args: { station: "ST002", fee: 30 } })
+  });
+  loadVehicles();
+}
+loadVehicles();
+</script>
+</body>
+</html>

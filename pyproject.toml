@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ontology-runtime"
+version = "0.1.0"
+description = "Ontology Runtime Kernel v0.1 - a small, embeddable semantic object runtime for Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Core is zero-dependency by design (Principle 6).
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+mcp = ["mcp>=1.0"]
+server = ["pyyaml>=6.0", "mcp>=1.0"]
+dev = ["pytest>=8.0", "pyyaml>=6.0"]
+
+[project.scripts]
+ontology = "ontology_runtime.adapters.cli:main"
+ontology-mcp = "ontology_runtime.adapters.mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

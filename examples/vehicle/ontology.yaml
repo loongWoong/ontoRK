@@ -1,0 +1,54 @@
+ontology:
+  name: traffic
+  version: 1
+
+objects:
+
+  Vehicle:
+    description: 车辆
+    properties:
+      plate:
+        type: string
+      type:
+        type: string
+      balance:
+        type: number
+
+  TollStation:
+    description: 收费站
+    properties:
+      name:
+        type: string
+      status:
+        type: string
+
+relations:
+
+  passes:
+    source: Vehicle
+    target: TollStation
+
+functions:
+
+  Vehicle.recharge:
+    target: Vehicle
+    description: 给车辆充值
+    input:
+      amount:
+        type: number
+
+  Vehicle.pass_station:
+    target: Vehicle
+    description: 车辆通过收费站，扣费并建立 passes 关系
+    input:
+      station:
+        type: string
+      fee:
+        type: number
+
+  TollStation.set_status:
+    target: TollStation
+    description: 设置收费站状态
+    input:
+      status:
+        type: string

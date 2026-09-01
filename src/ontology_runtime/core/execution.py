@@ -1,0 +1,158 @@
+"""Execution model: FunctionCall -> Mutations -> Changes -> FunctionResult.
+
+A function never touches the store directly.  It records mutations on the
+execution context; the runtime validates and applies them as one logical
+unit and turns them into changes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+from .errors import InvalidArgument, ObjectNotFound
+from .refs import ObjectRef
+from .state import Object
+
+MUTATION_SET_PROPERTY = "set_property"
+MUTATION_LINK = "link"
+MUTATION_UNLINK = "unlink"
+
+
+@dataclass(frozen=True, slots=True)
+class Mutation:
+    """A pending state change produced by a function.  Not yet applied."""
+
+    kind: str
+    object_ref: ObjectRef | None = None
+    property: str | None = None
+    value: object = None
+    source: ObjectRef | None = None
+    relation: str | None = None
+    target: ObjectRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Change:
+    """An applied state change.  ``old``/``new`` are filled by the store."""
+
+    kind: str
+    object_ref: ObjectRef | None = None
+    property: str | None = None
+    old: object = None
+    new: object = None
+    source: ObjectRef | None = None
+    relation: str | None = None
+    target: ObjectRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionCall:
+    """One concrete invocation request."""
+
+    function: str
+    target: ObjectRef | None
+    args: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FunctionResult:
+    """Standardized invocation result.
+
+    ``output``  - what the caller receives
+    ``changes`` - what changed in the world
+    ``error``   - why it failed
+
+    output != changes; they answer different questions.
+    """
+
+    execution_id: str
+    output: object | None = None
+    changes: list[Change] = field(default_factory=list)
+    error: Exception | None = None
+
+
+@dataclass(slots=True)
+class ExecutionContext:
+    """The only world a function sees.
+
+    Read access (object/get/find/related) is a facade over the state store.
+    Write access (set/link/unlink) only buffers mutations; they are applied
+    atomically after the function returns.  ``apply_mutations`` is injected
+    by the runtime and performs validate -> apply -> change.
+    """
+
+    function: str
+    execution_id: str
+    target: ObjectRef | None
+    args: dict[str, object]
+    _get_object: Callable[[ObjectRef], Object | None]
+    _find_objects: Callable[[str, dict], list[Object]]
+    _related: Callable[[ObjectRef, str, str], list[ObjectRef]]
+    _apply: Callable[[list[Mutation]], list[Change]]
+    _mutations: list[Mutation] = field(default_factory=list)
+
+    # ---- read ----
+
+    def object(self) -> Object:
+        """The target object of this invocation."""
+        if self.target is None:
+            raise InvalidArgument(f"function {self.function!r} has no target object")
+        obj = self._get_object(self.target)
+        if obj is None:
+            raise ObjectNotFound(f"object not found: {self.target}")
+        return obj
+
+    def get(self, ref: ObjectRef) -> Object:
+        obj = self._get_object(ref)
+        if obj is None:
+            raise ObjectNotFound(f"object not found: {ref}")
+        return obj
+
+    def find(self, object_type: str, **filters: object) -> list[Object]:
+        return self._find_objects(object_type, filters)
+
+    def related(
+        self, ref: ObjectRef, relation: str, direction: str = "out"
+    ) -> list[ObjectRef]:
+        return self._related(ref, relation, direction)
+
+    def ref(self, object_type: str, object_id: str) -> ObjectRef:
+        """Build an ObjectRef without importing kernel types in functions."""
+        return ObjectRef(object_type, object_id)
+
+    # ---- write (buffered) ----
+
+    def set(self, ref: ObjectRef, property: str, value: object) -> None:
+        self._mutations.append(
+            Mutation(
+                kind=MUTATION_SET_PROPERTY,
+                object_ref=ref,
+                property=property,
+                value=value,
+            )
+        )
+
+    def link(self, source: ObjectRef, relation: str, target: ObjectRef) -> None:
+        self._mutations.append(
+            Mutation(kind=MUTATION_LINK, source=source, relation=relation, target=target)
+        )
+
+    def unlink(self, source: ObjectRef, relation: str, target: ObjectRef) -> None:
+        self._mutations.append(
+            Mutation(kind=MUTATION_UNLINK, source=source, relation=relation, target=target)
+        )
+
+    # ---- commit ----
+
+    def apply_mutations(self) -> list[Change]:
+        """Validate + apply all buffered mutations as one logical unit."""
+        changes = self._apply(list(self._mutations))
+        self._mutations.clear()
+        return changes
+
+    def fail(self, message: str) -> None:
+        """Raise a business error that becomes ``FunctionResult.error``."""
+        from .errors import FunctionExecutionError
+
+        raise FunctionExecutionError(message)

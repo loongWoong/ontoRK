@@ -1,0 +1,13 @@
+bindings:
+
+  Vehicle.recharge:
+    executor: python
+    entrypoint: functions/recharge.py
+
+  Vehicle.pass_station:
+    executor: python
+    entrypoint: functions/pass_station.py
+
+  TollStation.set_status:
+    executor: python
+    entrypoint: functions/set_status.py
