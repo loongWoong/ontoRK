@@ -15,6 +15,7 @@ import uuid
 
 from ..core.errors import (
     InvalidArgument,
+    KernelError,
     ObjectNotFound,
     RelationNotFound,
     SchemaViolation,
@@ -163,12 +164,29 @@ class OntologyRuntime:
         target: ObjectRef | None = None,
         args: dict[str, object] | None = None,
     ) -> FunctionResult:
-        fdef = self.catalog.get(function)
-        args = dict(args or {})
-        self._check_args(fdef, args)
-        target = self._resolve_target(fdef, target)
+        """Execute a business capability.
 
+        ``invoke`` never raises: every failure - unknown function, invalid
+        arguments, missing target, business error, schema violation - is
+        reported through ``FunctionResult.error``.
+
+        The executor only runs the function; the runtime then validates and
+        applies the buffered mutations as one atomic unit.  A failed
+        invocation never leaves partial state behind.
+        """
         execution_id = f"exec-{uuid.uuid4().hex[:12]}"
+        try:
+            fdef = self.catalog.get(function)
+            args = dict(args or {})
+            self._check_args(fdef, args)
+            target = self._resolve_target(fdef, target)
+        except KernelError as exc:
+            return FunctionResult(execution_id=execution_id, error=exc)
+        except Exception as exc:  # malformed args container etc.
+            return FunctionResult(
+                execution_id=execution_id, error=InvalidArgument(str(exc))
+            )
+
         context = ExecutionContext(
             function=fdef.name,
             execution_id=execution_id,
@@ -177,13 +195,22 @@ class OntologyRuntime:
             _get_object=self.store.get_object,
             _find_objects=self._find_for_context,
             _related=self.store.related,
-            _apply=self._apply_mutations,
         )
         call = FunctionCall(function=fdef.name, target=target, args=args)
         try:
-            return self.executor.execute(call, context)
+            result = self.executor.execute(call, context)
         except Exception as exc:  # kernel + business errors become results
             return FunctionResult(execution_id=execution_id, error=exc)
+
+        if result.error is not None:
+            return result  # executor already failed; never apply its buffer
+        try:
+            result.changes = self._apply_mutations(context.take_mutations())
+        except Exception as exc:
+            # validation failed or store rejected a precondition:
+            # nothing has been applied (validate-before-apply)
+            return FunctionResult(execution_id=execution_id, error=exc)
+        return result
 
     # ------------------------------------------------------------------
     # pipeline internals
@@ -193,6 +220,8 @@ class OntologyRuntime:
         return self.find(object_type, **filters)
 
     def _apply_mutations(self, mutations: list[Mutation]) -> list[Change]:
+        """Validate every mutation first, then apply - the atomic commit
+        step of the pipeline.  Only the runtime calls this."""
         for mutation in mutations:
             self._validate_mutation(mutation)
         return self.store.apply(mutations)

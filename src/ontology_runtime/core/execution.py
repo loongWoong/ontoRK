@@ -1,8 +1,10 @@
 """Execution model: FunctionCall -> Mutations -> Changes -> FunctionResult.
 
-A function never touches the store directly.  It records mutations on the
-execution context; the runtime validates and applies them as one logical
-unit and turns them into changes.
+A function never touches the store directly and can never commit state:
+it only records mutations on the execution context.  After the function
+returns, the runtime validates the whole buffer and applies it as one
+logical unit, turning it into changes (one invocation = one atomic
+state change).
 """
 
 from __future__ import annotations
@@ -77,9 +79,10 @@ class ExecutionContext:
     """The only world a function sees.
 
     Read access (object/get/find/related) is a facade over the state store.
-    Write access (set/link/unlink) only buffers mutations; they are applied
-    atomically after the function returns.  ``apply_mutations`` is injected
-    by the runtime and performs validate -> apply -> change.
+    Write access (set/link/unlink) only buffers mutations.  There is no way
+    for a function to apply or commit them: the runtime drains the buffer
+    after the function returns and applies it atomically.  A function that
+    fails mid-way therefore never leaves partial state behind.
     """
 
     function: str
@@ -89,7 +92,6 @@ class ExecutionContext:
     _get_object: Callable[[ObjectRef], Object | None]
     _find_objects: Callable[[str, dict], list[Object]]
     _related: Callable[[ObjectRef, str, str], list[ObjectRef]]
-    _apply: Callable[[list[Mutation]], list[Change]]
     _mutations: list[Mutation] = field(default_factory=list)
 
     # ---- read ----
@@ -143,13 +145,19 @@ class ExecutionContext:
             Mutation(kind=MUTATION_UNLINK, source=source, relation=relation, target=target)
         )
 
-    # ---- commit ----
+    # ---- buffer handoff (runtime only) ----
 
-    def apply_mutations(self) -> list[Change]:
-        """Validate + apply all buffered mutations as one logical unit."""
-        changes = self._apply(list(self._mutations))
+    def take_mutations(self) -> list[Mutation]:
+        """Drain the mutation buffer; the runtime applies the result.
+
+        Functions normally never call this - the runtime does, exactly once,
+        after the function returns.  Draining mid-function is equivalent to
+        "these mutations never happened": nothing is applied until the
+        runtime sees the buffer after a normal return.
+        """
+        mutations = list(self._mutations)
         self._mutations.clear()
-        return changes
+        return mutations
 
     def fail(self, message: str) -> None:
         """Raise a business error that becomes ``FunctionResult.error``."""

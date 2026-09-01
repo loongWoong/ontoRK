@@ -1,8 +1,10 @@
 """FunctionExecutor Port: how a FunctionDef is actually executed.
 
-The executor loads the implementation (binding), runs it against the
-execution context, collects mutations and finalizes them into a
-FunctionResult.  Default implementation: PythonFunctionExecutor.
+Contract: the executor runs the function against the context and returns a
+FunctionResult carrying the output (or raises; the runtime turns that into
+``FunctionResult.error``).  Mutations buffered on the context are validated
+and applied by the runtime after execute() returns - never by the executor.
+Default implementation: PythonFunctionExecutor.
 """
 
 from __future__ import annotations

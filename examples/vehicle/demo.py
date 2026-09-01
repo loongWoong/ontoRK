@@ -9,6 +9,12 @@ import json
 import sys
 from pathlib import Path
 
+# Windows consoles often default to GBK; force UTF-8 so Chinese output
+# survives pipes and redirects.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 EXAMPLE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXAMPLE_DIR.parents[1] / "src"))
 

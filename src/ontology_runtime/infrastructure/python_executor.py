@@ -4,10 +4,12 @@ Responsibilities:
     read the function binding
     load the python function (cached)
     run it with the ExecutionContext
-    collect mutations -> validate -> apply (via context)
-    return FunctionResult
+    return a FunctionResult carrying the output
 
-The script only ever sees ``ctx`` - never the store, SQLite, MCP or HTTP.
+The executor never applies state: mutations buffered by the function stay
+on the context, and the runtime validates + applies them atomically after
+execute() returns.  The script only ever sees ``ctx`` - never the store,
+SQLite, MCP or HTTP.
 """
 
 from __future__ import annotations
@@ -53,10 +55,9 @@ class PythonFunctionExecutor:
             raise FunctionExecutionError(
                 f"function {call.function!r} failed: {exc}"
             ) from exc
-        changes = context.apply_mutations()
-        return FunctionResult(
-            execution_id=context.execution_id, output=output, changes=changes
-        )
+        # Mutations stay buffered on the context; the runtime finalizes them
+        # (validate -> apply -> changes) as one atomic unit.
+        return FunctionResult(execution_id=context.execution_id, output=output)
 
     # ---- internals ----
 

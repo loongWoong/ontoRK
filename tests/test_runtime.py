@@ -111,23 +111,24 @@ def test_business_error_is_atomic(runtime):
     assert runtime.related(ObjectRef("Vehicle", "V002"), "passes") == []
 
 
-def test_invoke_validates_function_and_args(runtime):
-    with pytest.raises(FunctionNotFound):
-        runtime.invoke("Vehicle.fly")
-    with pytest.raises(InvalidArgument):
-        runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"), args={})
-    with pytest.raises(InvalidArgument):
-        runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
-                       args={"amount": "many"})
-    with pytest.raises(InvalidArgument):
-        runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
-                       args={"amount": 1, "extra": 2})
-    with pytest.raises(InvalidArgument):
-        runtime.invoke("Vehicle.recharge", target=ObjectRef("TollStation", "ST001"),
-                       args={"amount": 1})
-    with pytest.raises(ObjectNotFound):
-        runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "GHOST"),
-                       args={"amount": 1})
+def test_invoke_reports_precheck_errors_in_result(runtime):
+    """invoke never raises: pre-check failures land in result.error (G2)."""
+    cases = [
+        (("Vehicle.fly",), {}, FunctionNotFound),
+        (("Vehicle.recharge",), {"args": {}}, InvalidArgument),  # missing amount
+        (("Vehicle.recharge",), {"args": {"amount": "many"}}, InvalidArgument),
+        (("Vehicle.recharge",), {"args": {"amount": 1, "extra": 2}}, InvalidArgument),
+        (("Vehicle.recharge",), {"target": ObjectRef("TollStation", "ST001"),
+                                 "args": {"amount": 1}}, InvalidArgument),
+        (("Vehicle.recharge",), {"target": ObjectRef("Vehicle", "GHOST"),
+                                 "args": {"amount": 1}}, ObjectNotFound),
+    ]
+    for pos, kw, expected in cases:
+        result = runtime.invoke(*pos, **kw)
+        assert isinstance(result.error, expected), (pos, kw, result.error)
+        assert result.changes == []
+    # none of the failed invocations touched state
+    assert runtime.get(ObjectRef("Vehicle", "V001")).properties["balance"] == 100
 
 
 def test_mutation_schema_validation(runtime):
@@ -140,9 +141,12 @@ def test_mutation_schema_validation(runtime):
         return None
 
     class EchoExecutor:
+        """Minimal executor mirroring PythonFunctionExecutor's contract:
+        run the function, return the output, never apply mutations."""
+
         def execute(self, call, context):
             bad_fn(context)
-            return FunctionResult(context.execution_id, None, context.apply_mutations(), None)
+            return FunctionResult(context.execution_id, None)
 
     runtime.executor = EchoExecutor()
     result = runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
@@ -164,3 +168,69 @@ def test_kernel_error_from_function_becomes_result_error(runtime):
     result = runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
                             args={"amount": 1})
     assert isinstance(result.error, ObjectNotFound)
+
+
+# ----------------------------------------------------------------------
+# atomicity regression tests (G1: the runtime owns the commit)
+# ----------------------------------------------------------------------
+
+
+def test_exception_after_mutation_is_atomic(runtime):
+    """A function that buffers a mutation and then crashes applies nothing."""
+    from ontology_runtime.core.execution import FunctionResult
+
+    class CrashingExecutor:
+        def execute(self, call, context):
+            context.set(ObjectRef("Vehicle", "V001"), "balance", 999)
+            raise RuntimeError("crash after set")
+
+    runtime.executor = CrashingExecutor()
+    result = runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
+                            args={"amount": 1})
+    assert result.error is not None
+    assert result.changes == []
+    assert runtime.get(ObjectRef("Vehicle", "V001")).properties["balance"] == 100
+
+
+def test_function_cannot_commit_partially(runtime):
+    """G1 regression: there is no way for a function to apply its own
+    mutations.  Draining the buffer mid-function is equivalent to "never
+    mutated"; a pending mutation at crash time is never applied."""
+    from ontology_runtime.core.errors import FunctionExecutionError
+    from ontology_runtime.core.execution import FunctionResult
+
+    def sneaky(ctx):
+        ref = ctx.object().ref
+        ctx.set(ref, "balance", 1)
+        ctx.take_mutations()  # drain: these mutations never happened
+        ctx.set(ref, "balance", 2)
+        ctx.fail("boom")      # crash with a pending mutation
+
+    class SneakyExecutor:
+        def execute(self, call, context):
+            sneaky(context)
+            return FunctionResult(context.execution_id, None)
+
+    runtime.executor = SneakyExecutor()
+    result = runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
+                            args={"amount": 1})
+    assert isinstance(result.error, FunctionExecutionError)
+    assert result.changes == []
+    assert runtime.get(ObjectRef("Vehicle", "V001")).properties["balance"] == 100
+
+
+def test_executor_error_result_skips_mutation_apply(runtime):
+    """If the executor already returned an error result, its mutation
+    buffer is discarded, never applied."""
+    from ontology_runtime.core.execution import FunctionResult
+
+    class FailedExecutor:
+        def execute(self, call, context):
+            context.set(ObjectRef("Vehicle", "V001"), "balance", 999)
+            return FunctionResult(context.execution_id, None, [], InvalidArgument("no"))
+
+    runtime.executor = FailedExecutor()
+    result = runtime.invoke("Vehicle.recharge", target=ObjectRef("Vehicle", "V001"),
+                            args={"amount": 1})
+    assert isinstance(result.error, InvalidArgument)
+    assert runtime.get(ObjectRef("Vehicle", "V001")).properties["balance"] == 100

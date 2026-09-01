@@ -27,12 +27,21 @@ from ..core.refs import ObjectRef
 from .assembly import OntologyRuntime, build_runtime
 from .serialize import error_to_dict, to_jsonable
 
-_STATUS = {
-    ObjectNotFound: 404,
-    RelationNotFound: 404,
-    FunctionNotFound: 404,
-    InvalidArgument: 400,
-}
+_STATUS_BY_ERROR = (
+    (ObjectNotFound, 404),
+    (RelationNotFound, 404),
+    (FunctionNotFound, 404),
+    (InvalidArgument, 400),
+)
+
+
+def _status_for(error: Exception, default: int) -> int:
+    """Map a kernel error to an HTTP status via isinstance, so subclasses
+    of the built-in errors keep mapping correctly."""
+    for cls, code in _STATUS_BY_ERROR:
+        if isinstance(error, cls):
+            return code
+    return default
 
 
 def _parse_scalar(text: str):
@@ -70,7 +79,7 @@ def build_handler(runtime: OntologyRuntime) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
 
         def _error(self, exc: Exception) -> None:
-            status = _STATUS.get(type(exc), 400) if isinstance(exc, KernelError) else 500
+            status = _status_for(exc, 400) if isinstance(exc, KernelError) else 500
             self._send(status, {"error": error_to_dict(exc)})
 
         # ---- GET ----
@@ -134,7 +143,7 @@ def build_handler(runtime: OntologyRuntime) -> type[BaseHTTPRequestHandler]:
                 }
                 status = 200
                 if result.error is not None:
-                    status = _STATUS.get(type(result.error), 422)
+                    status = _status_for(result.error, 422)
                 return self._send(status, payload)
             except KernelError as exc:
                 return self._error(exc)

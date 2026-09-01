@@ -121,7 +121,7 @@ ontology-mcp --schema examples/vehicle/ontology.yaml \
 | `get(ObjectRef)` | 取单个对象 | `ObjectNotFound` |
 | `find(type, **filters)` | Django 风格过滤：`balance__gt=100` | 不建 Query DSL |
 | `related(ref, relation, direction)` | 关系导航，`out` / `in` | 返回 `list[ObjectRef]` |
-| `invoke(function, target, args)` | 执行业务能力 | 返回 `FunctionResult` |
+| `invoke(function, target, args)` | 执行业务能力 | 返回 `FunctionResult`；**永不 raise**，一切错误进 `result.error` |
 
 **写操作不是 Agent API**。`create/update/delete/link/unlink` 是 State Mutation
 Primitive，只存在于 Function 内部（通过 `ctx`）。Agent 通过"业务能力"改变世界，
@@ -135,15 +135,17 @@ FunctionCall
   → Validate args              (InvalidArgument)
   → Resolve Target             (InvalidArgument / ObjectNotFound)
   → Build ExecutionContext     (只暴露 ctx，不暴露 Store)
-  → Execute Function           (ctx.set / ctx.link / ctx.unlink 缓存 Mutation)
-  → Collect Mutations
+  → Execute Function           (ctx.set / ctx.link / ctx.unlink 只缓冲 Mutation)
+  → Collect Mutations          (Runtime 从 context 取走缓冲区)
   → Validate against Schema    (SchemaViolation / RelationNotFound)
   → Apply atomically           (Store.apply，一次逻辑单元)
   → Generate Changes
   → FunctionResult
 ```
 
-一次 Invocation 是一个原子单元：函数中途失败（业务错误、校验失败），
+提交权归 Runtime：函数**无法**提交状态——context 不暴露任何 apply/commit
+方法，Executor 只负责运行函数，Runtime 在函数正常返回后统一
+Validate → Apply。函数中途失败（业务异常、崩溃、校验失败），
 **所有 Mutation 都不会生效**。不做分布式事务 / Saga / Event Sourcing。
 
 ## 7. 领域模型（冻结）
@@ -168,6 +170,9 @@ FunctionCall
 → `ObjectNotFound / RelationNotFound / FunctionNotFound / InvalidArgument /
 SchemaViolation / FunctionExecutionError`，由 Adapter 转换为 MCP error /
 HTTP 4xx/5xx / CLI exit code。
+
+`invoke` 永不 raise：前置校验失败（函数不存在/参数非法/目标不存在）与
+执行期失败统一进 `result.error`，嵌入方只需检查一个字段。
 
 ## 8. 最小 Ontology（examples/vehicle/ontology.yaml）
 
@@ -209,12 +214,12 @@ def execute(ctx):
 
 | 模块 | 行数 | 设计预算 |
 |------|-----:|---------|
-| Core（schema/state/execution/refs/types/errors） | 415 | 300~500 |
-| Runtime | 303 | 200~300 |
+| Core（schema/state/execution/refs/types/errors） | 419 | 300~500 |
+| Runtime | 327 | 200~300（v0.1.1 提交权收编 +错误统一，+29 行） |
 | MemoryStateStore | 128 | 100~200 |
 | SQLiteStateStore | 190 | — |
-| PythonFunctionExecutor | 109 | 100~200 |
-| CLI / HTTP / MCP Adapter | 139 / 179 / 114 | 各 100~300 |
+| PythonFunctionExecutor | 110 | 100~200 |
+| CLI / HTTP / MCP Adapter | 143 / 201 / 114 | 各 100~300 |
 
 核心语义在 ~500 行内可完整理解。若 Core 超过 1000 行，警惕平台化。
 
@@ -255,9 +260,11 @@ def execute(ctx):
 
 1. **`RuntimeError` → `KernelError`**：避免遮蔽 Python 内置异常，语义不变。
 2. **Mutation 应用点**：规格 §25 让 Executor 返回 FunctionResult，§4/§20 要求
-   状态修改必须经过 Runtime。落地为：Executor 调用 `context.apply_mutations()`
-   （由 Runtime 注入 validate→apply 回调），保证 Store 只被 Runtime 触达，
-   两个条款同时满足。
+   状态修改必须经过 Runtime。v0.1 草案曾由 Executor 调用
+   `context.apply_mutations()` 提交；v0.1.1 收紧为：**函数无法提交状态**，
+   Executor 只运行函数，Runtime 在函数正常返回后从 context 取走 Mutation
+   缓冲区并统一 Validate → Apply（见 §6）。Store 依然只被 Runtime 触达，
+   且消除了函数中途部分提交的可能。
 3. **`describe()` 分级**：索引级 + `describe_object/relation/function` 按需详查，
    与规格 §23 一致。
 
@@ -276,5 +283,20 @@ examples/
 ├── agent/           simple_agent.py（Discover→Observe→Traverse→Act→Observe）
 ├── mcp/             smoke_test.py
 └── html/            index.html（Ontology-driven UI）
-tests/               66 个测试：类型/加载/双 Store/管线/原子性/CLI/HTTP
+tests/               78 个测试：类型/加载/双 Store/管线/原子性回归/MCP 端到端/CLI/HTTP
 ```
+
+## 14. v0.1.1 修订记录
+
+依据 `docs/v0.1-completeness-review.md` 完成度审查，修复以下缺口：
+
+| # | 缺口 | 修复 |
+|---|------|------|
+| G1 | `ctx.apply_mutations()` 公开，函数可中途部分提交，违反 §31 原子性 | 提交权收编 Runtime：context 只暴露 `take_mutations()`（缓冲区移交），Executor 不再申请提交，Runtime 在函数返回后统一 Validate→Apply；新增 3 个原子性回归测试 |
+| G2 | `invoke` 错误路径不对称：前置校验 raise、执行期错误进 `result.error` | `invoke` 永不 raise，一切错误统一进 `result.error`；CLI/HTTP/MCP 同步验证 |
+| G4 | HTTP 状态码按 `type(exc)` 精确匹配，自定义错误子类会误判 | 改为 isinstance 遍历映射 |
+| G6 | MCP Adapter 仅有 list_tools smoke test | 新增 `tests/test_mcp.py`：9 个端到端测试（7 工具发现 + get/find/related/invoke/错误路径） |
+| G5 | Windows GBK 控制台中文乱码 | demo / agent / CLI 输出强制 UTF-8 |
+| G5 | 无版本控制、构建产物散落 | git init + `.gitignore`，基线打 `v0.1.0` tag |
+
+G3（SQLite find 全表扫描）按计划留给 v0.2。
