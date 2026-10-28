@@ -2,6 +2,11 @@
 
 Pipeline: Parse -> Resolve -> Validate -> freeze.  Core schema never sees
 YAML; this module is the only place that knows file formats exist.
+
+v0.2 parses the declarative constraint surface (property constraints,
+identity, category, state machine, relation cardinality/inverse, ontology
+profile/schema_version).  Illegal values raise :class:`SchemaViolation`
+here, at load time, so an invalid schema can never become runtime state.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ from pathlib import Path
 from ..core.errors import SchemaViolation
 from ..core.refs import ObjectRef
 from ..core.schema import (
+    CARDINALITIES,
     CapabilityCatalog,
     FunctionDef,
     ObjectType,
@@ -61,6 +67,8 @@ def parse_schema(data: dict) -> tuple[OntologySchema, CapabilityCatalog]:
         name=str(onto.get("name", "untitled")),
         version=int(onto.get("version", 1)),
         namespace=onto.get("namespace"),
+        profile=_parse_profile(onto),
+        schema_version=_parse_schema_version(onto),
     )
 
     objects_data = data.get("objects", {}) or {}
@@ -73,6 +81,9 @@ def parse_schema(data: dict) -> tuple[OntologySchema, CapabilityCatalog]:
             name=name,
             description=spec.get("description"),
             properties=properties,
+            identity=_parse_identity(name, spec.get("identity"), properties),
+            category=_parse_category(name, spec.get("category")),
+            state_machine=spec.get("state_machine"),
         )
 
     relations_data = data.get("relations", {}) or {}
@@ -91,8 +102,10 @@ def parse_schema(data: dict) -> tuple[OntologySchema, CapabilityCatalog]:
             name=name,
             source=source,
             target=target,
-            cardinality=spec.get("cardinality"),
+            cardinality=_parse_cardinality(name, spec.get("cardinality")),
+            inverse=_parse_inverse(name, spec.get("inverse")),
         )
+    _validate_inverses(schema)
 
     functions_data = data.get("functions", {}) or {}
     catalog = CapabilityCatalog()
@@ -137,11 +150,23 @@ def load_bindings_file(path: str | Path) -> dict[str, FunctionBinding]:
 
 
 def parse_seed(data: dict) -> tuple[list[Object], list[Relation]]:
-    """Parse seed data: objects + relations with 'Type/Id' references."""
+    """Parse seed data: objects + relations with 'Type/Id' references.
+
+    Objects may carry the (optional) temporal metadata ``version`` /
+    ``updated_at`` / ``source``; everything defaults to a fresh object.
+    """
     objects: list[Object] = []
     for item in data.get("objects", []) or []:
         ref = ObjectRef(item["type"], item["id"])
-        objects.append(Object(ref=ref, properties=dict(item.get("properties", {}))))
+        objects.append(
+            Object(
+                ref=ref,
+                properties=dict(item.get("properties", {})),
+                version=int(item.get("version", 1)),
+                updated_at=item.get("updated_at"),
+                source=item.get("source"),
+            )
+        )
     relations: list[Relation] = []
     for item in data.get("relations", []) or []:
         relations.append(
@@ -163,12 +188,140 @@ def load_seed(path: str | Path) -> tuple[list[Object], list[Relation]]:
 # ----------------------------------------------------------------------
 
 
+def _parse_profile(onto: dict) -> str:
+    profile = onto.get("profile", "standard")
+    if not isinstance(profile, str) or not profile:
+        raise SchemaViolation("ontology.profile must be a non-empty string")
+    return profile
+
+
+def _parse_schema_version(onto: dict) -> int:
+    value = onto.get("schema_version", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SchemaViolation("ontology.schema_version must be a positive integer")
+    return value
+
+
+def _parse_category(name: str, raw) -> str:
+    if raw is None:
+        return "object"
+    if not isinstance(raw, str) or not raw:
+        raise SchemaViolation(f"object type {name!r}: category must be a string")
+    return raw
+
+
+def _parse_identity(
+    name: str, raw, properties: dict[str, PropertyDef]
+) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise SchemaViolation(f"object type {name!r}: identity must be a list")
+    identity: list[str] = []
+    for prop in raw:
+        if not isinstance(prop, str) or not prop:
+            raise SchemaViolation(
+                f"object type {name!r}: identity entries must be property names"
+            )
+        if prop not in properties:
+            raise SchemaViolation(
+                f"object type {name!r}: identity property {prop!r} is not defined"
+            )
+        identity.append(prop)
+    if len(set(identity)) != len(identity):
+        raise SchemaViolation(f"object type {name!r}: identity has duplicates")
+    return tuple(identity)
+
+
+def _parse_cardinality(name: str, raw) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in CARDINALITIES:
+        raise SchemaViolation(
+            f"relation {name!r}: invalid cardinality {raw!r}, "
+            f"expected one of {list(CARDINALITIES)}"
+        )
+    return raw
+
+
+def _parse_inverse(name: str, raw) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw:
+        raise SchemaViolation(f"relation {name!r}: inverse must be a string")
+    return raw
+
+
+def _validate_inverses(schema: OntologySchema) -> None:
+    """The inverse role must exist and point the other way (schema coherence)."""
+    for relation in schema.relations.values():
+        if relation.inverse is None:
+            continue
+        inverse = schema.relations.get(relation.inverse)
+        if inverse is None:
+            raise SchemaViolation(
+                f"relation {relation.name!r}: inverse {relation.inverse!r} "
+                "is not a defined relation"
+            )
+        if relation.inverse == relation.name and relation.source != relation.target:
+            raise SchemaViolation(
+                f"relation {relation.name!r}: a non-reflexive relation cannot "
+                "be its own inverse"
+            )
+        if inverse.source != relation.target or inverse.target != relation.source:
+            raise SchemaViolation(
+                f"relation {relation.name!r}: inverse {inverse.name!r} must go "
+                f"{relation.target} -> {relation.source}, "
+                f"got {inverse.source} -> {inverse.target}"
+            )
+
+
 def _parse_property(prop_name: str, spec) -> PropertyDef:
     # shorthand: "plate: string" or plate: string
     if isinstance(spec, str):
         spec = {"type": spec}
+    if not isinstance(spec, dict):
+        raise SchemaViolation(f"property {prop_name!r}: definition must be a mapping")
     type_def = _parse_type(prop_name, "property", spec.get("type"))
-    return PropertyDef(type=type_def, description=spec.get("description"))
+    try:
+        return PropertyDef(
+            type=type_def,
+            description=spec.get("description"),
+            required=_parse_bool(prop_name, "required", spec.get("required", False)),
+            enum=spec.get("enum"),
+            minimum=spec.get("minimum"),
+            maximum=spec.get("maximum"),
+            unique=_parse_bool(prop_name, "unique", spec.get("unique", False)),
+            unit=spec.get("unit"),
+            precision=spec.get("precision"),
+            default=spec.get("default"),
+            temporal=_parse_temporal(prop_name, spec.get("temporal", False)),
+        )
+    except SchemaViolation as exc:
+        raise SchemaViolation(f"property {prop_name!r}: {exc}") from None
+
+
+def _parse_bool(prop_name: str, field: str, value) -> bool:
+    if not isinstance(value, bool):
+        raise SchemaViolation(
+            f"property {prop_name!r}: {field} must be a boolean, got {value!r}"
+        )
+    return value
+
+
+def _parse_temporal(prop_name: str, value) -> bool | str:
+    """``temporal`` is a flag, or a mode string (e.g. "snapshot", "valid-time")
+    when the platform declares a temporal mode."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value:
+        return value
+    raise SchemaViolation(
+        f"property {prop_name!r}: temporal must be a boolean or a non-empty "
+        f"mode string, got {value!r}"
+    )
 
 
 def _parse_type(what: str, owner: str, spec) -> TypeDef:

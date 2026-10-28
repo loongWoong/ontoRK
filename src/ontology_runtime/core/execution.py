@@ -5,6 +5,12 @@ it only records mutations on the execution context.  After the function
 returns, the runtime validates the whole buffer and applies it as one
 logical unit, turning it into changes (one invocation = one atomic
 state change).
+
+v0.2: every applied Change is stamped with a store-assigned ``seq`` (a
+continuous change-log sequence), a ``ts`` timestamp and the
+``execution_id`` that produced it; the FunctionResult reports a
+``status`` (succeeded / failed / unknown) so callers can tell a clean
+failure from an unknown outcome (e.g. a timeout).
 """
 
 from __future__ import annotations
@@ -19,6 +25,16 @@ from .state import Object
 MUTATION_SET_PROPERTY = "set_property"
 MUTATION_LINK = "link"
 MUTATION_UNLINK = "unlink"
+#: Change kind emitted by ``StateStore.apply_delta`` when it materializes an object.
+MUTATION_CREATE_OBJECT = "create_object"
+#: Change kind emitted by ``StateStore.delete_objects`` when the source of
+#: truth no longer contains an object (projection deletion propagation).
+MUTATION_DELETE_OBJECT = "delete_object"
+
+STATUS_SUCCEEDED = "succeeded"
+STATUS_FAILED = "failed"
+STATUS_UNKNOWN = "unknown"
+STATUSES: tuple[str, ...] = (STATUS_SUCCEEDED, STATUS_FAILED, STATUS_UNKNOWN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +52,12 @@ class Mutation:
 
 @dataclass(frozen=True, slots=True)
 class Change:
-    """An applied state change.  ``old``/``new`` are filled by the store."""
+    """An applied state change.  ``old``/``new`` are filled by the store.
+
+    ``seq``/``ts``/``execution_id`` are appended at the end so existing
+    positional construction stays valid; the store fills them when it logs
+    the change.
+    """
 
     kind: str
     object_ref: ObjectRef | None = None
@@ -46,6 +67,9 @@ class Change:
     source: ObjectRef | None = None
     relation: str | None = None
     target: ObjectRef | None = None
+    seq: int = 0
+    ts: str | None = None
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +88,7 @@ class FunctionResult:
     ``output``  - what the caller receives
     ``changes`` - what changed in the world
     ``error``   - why it failed
+    ``status``  - ``succeeded`` / ``failed`` / ``unknown`` (appended, v0.2)
 
     output != changes; they answer different questions.
     """
@@ -72,6 +97,14 @@ class FunctionResult:
     output: object | None = None
     changes: list[Change] = field(default_factory=list)
     error: Exception | None = None
+    status: str = STATUS_SUCCEEDED
+
+    def __post_init__(self) -> None:
+        if self.status not in STATUSES:
+            raise InvalidArgument(
+                f"invalid FunctionResult status {self.status!r}, "
+                f"expected one of {list(STATUSES)}"
+            )
 
 
 @dataclass(slots=True)
